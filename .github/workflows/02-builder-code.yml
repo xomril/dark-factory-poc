@@ -128,6 +128,8 @@ jobs:
           # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ISSUE: ${{ steps.ctx.outputs.issue }}
           PR: ${{ steps.ctx.outputs.pr }}
+          # Model per station: override with repo variable BUILDER_MODEL (Settings > Variables).
+          AGENT_MODEL: ${{ vars.BUILDER_MODEL || 'claude-haiku-5-5' }}
           AGENT_ALLOWED_TOOLS: "Read,Grep,Glob,Write,Edit"
         run: |
           "$TRUSTED/scripts/run_agent.sh" builder \

@@ -56,6 +56,8 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Model per station: override with repo variable ARCHITECT_MODEL (Settings > Variables).
+          AGENT_MODEL: ${{ vars.ARCHITECT_MODEL || 'claude-haiku-5-5' }}
           AGENT_ALLOWED_TOOLS: "Read,Grep,Glob"
         run: |
           .factory/scripts/run_agent.sh architect \
