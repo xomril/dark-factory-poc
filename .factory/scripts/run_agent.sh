@@ -43,6 +43,14 @@ END_MS=$(( $(date +%s) * 1000 ))
 
 jq -r '.result // ""' "$RAW" > "$OUT"
 
+# Leak tripwire: agent output ends up in public comments, so it must never carry a secret.
+export SCAN_SECRET_1="${ANTHROPIC_API_KEY:-}"
+if ! "$(dirname "$0")/scan_secrets.sh" "$OUT"; then
+  rm -f "$OUT" "$RAW"
+  echo "::error::Agent output contained secret-like content and was discarded" >&2
+  exit 1
+fi
+
 jq -c \
   --arg run_id "${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${STATION}" \
   --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

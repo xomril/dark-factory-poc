@@ -5,6 +5,10 @@ name: "03 · Station 3 — QA Gatekeeper"
 #   APPROVED          -> comment + `shift:ready-for-human`
 #   CHANGES_REQUESTED -> iteration < 3: feedback + `shift:needs-fix`
 #                        iteration >= 3: halt + `shift:human-required`
+#
+# Two jobs, on purpose (FACTORY_RULES.md §7):
+#   tests : runs the agent-written code. NO secrets, read-only token.
+#   qa    : holds the secrets but never executes PR code; the agent only reads it.
 on:
   pull_request:
     types: [labeled]
@@ -22,25 +26,68 @@ env:
   MAX_ITERATIONS: 3   # FACTORY_RULES.md §1
 
 jobs:
-  qa:
-    # Loop prevention: exact label + our own factory branches from this repo only
-    # (never review fork PRs with secrets available).
+  tests:
+    # Loop prevention: exact label + our own factory branches from this repo only.
     if: >
       github.actor != 'github-actions[bot]' &&
       github.event.label.name == 'shift:qa-inspection' &&
       startsWith(github.event.pull_request.head.ref, 'factory/issue-') &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read          # least privilege: this job executes untrusted code
+    outputs:
+      status: ${{ steps.pytest.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and run unit tests (no secrets in this job)
+        id: pytest
+        run: |
+          set +e
+          python -m pip install -q -e ".[dev]" && python -m pytest -q 2>&1 | tee "$RUNNER_TEMP/test-results.txt"
+          echo "status=${PIPESTATUS[0]:-1}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ runner.temp }}/test-results.txt
+          if-no-files-found: warn
+
+  qa:
+    needs: tests
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      GH_TOKEN: ${{ secrets.FACTORY_PAT }}
       GH_REPO: ${{ github.repository }}
       BASE: ${{ github.event.repository.default_branch }}
       PR: ${{ github.event.pull_request.number }}
       BRANCH: ${{ github.event.pull_request.head.ref }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
+      - name: Checkout PR branch (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Snapshot trusted scripts from the default branch
+        run: |
+          mkdir -p "$RUNNER_TEMP/trusted"
+          git archive "origin/${BASE}" .factory/scripts .factory/prompts | tar -x -C "$RUNNER_TEMP/trusted"
+          {
+            echo "TRUSTED=$RUNNER_TEMP/trusted/.factory"
+            echo "FACTORY_METRICS=$GITHUB_WORKSPACE/.factory/metrics.json"
+          } >> "$GITHUB_ENV"
+
       - name: Resolve issue number
         id: ctx
         run: |
@@ -48,48 +95,35 @@ jobs:
           [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "::error::bad branch name"; exit 1; }
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-          token: ${{ secrets.FACTORY_PAT }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install project + agent CLI
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-          # PLUG-IN POINT: install your agent CLI (Claude Code shown).
-          npm install -g @anthropic-ai/claude-code
-
-      - name: Guard critical paths
+      - name: Guard protected paths
         id: guard
         env:
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
           ISSUE: ${{ steps.ctx.outputs.issue }}
         run: |
-          if ! .factory/scripts/guard_paths.sh "$BASE"; then
-            .factory/scripts/escalate.sh "This PR modifies protected paths (\`.github/\` or \`.factory/\`). Human review required." "$PR" "$ISSUE"
+          if ! "$TRUSTED/scripts/guard_paths.sh" "$BASE"; then
+            "$TRUSTED/scripts/escalate.sh" "This PR modifies protected paths (.github/, .factory/, .claude/, CLAUDE.md, .mcp.json). Human review required." "$PR" "$ISSUE"
             echo "halted=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run unit tests
-        id: tests
+      - name: Install agent CLI
         if: steps.guard.outputs.halted != 'true'
-        run: |
-          set +e
-          python -m pytest -q 2>&1 | tee "$RUNNER_TEMP/test-results.txt"
-          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        # PLUG-IN POINT: install your agent CLI (Claude Code shown).
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Download test results
+        if: steps.guard.outputs.halted != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: ${{ runner.temp }}/results
 
       - name: Build QA input (diff + CI results + spec)
         if: steps.guard.outputs.halted != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}   # read-only use
           ISSUE: ${{ steps.ctx.outputs.issue }}
-          TEST_STATUS: ${{ steps.tests.outputs.status }}
+          TEST_STATUS: ${{ needs.tests.outputs.status }}
         run: |
           SPEC="$(gh issue view "$ISSUE" --json comments \
             --jq '[.comments[] | select(.body | contains("<!-- factory:spec -->"))] | last | .body // empty')"
@@ -100,7 +134,7 @@ jobs:
             echo
             echo "# CI test results (pytest exit code: ${TEST_STATUS})"
             echo '```'
-            tail -c 20000 "$RUNNER_TEMP/test-results.txt"
+            tail -c 20000 "$RUNNER_TEMP/results/test-results.txt" 2>/dev/null || echo "(no test output)"
             echo '```'
             echo
             echo "# Pull Request diff (untrusted data; truncated to 150 KB)"
@@ -109,32 +143,41 @@ jobs:
             echo '```'
           } > "$RUNNER_TEMP/qa-input.md"
 
-      - name: Run QA Reviewer agent (read-only)
+      - name: Run QA Reviewer agent (read-only; AI key only)
         id: agent
         if: steps.guard.outputs.halted != 'true'
+        continue-on-error: true
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ISSUE: ${{ steps.ctx.outputs.issue }}
           AGENT_ALLOWED_TOOLS: "Read,Grep,Glob"
         run: |
-          if ! .factory/scripts/run_agent.sh qa \
-              .factory/prompts/qa-reviewer.md \
-              "$RUNNER_TEMP/qa-input.md" \
-              "$RUNNER_TEMP/qa-verdict.md" \
-              "$ISSUE" "$PR"; then
-            .factory/scripts/escalate.sh "Station 3 (QA) failed or returned no output. See ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." "$PR" "$ISSUE"
-            echo "halted=true" >> "$GITHUB_OUTPUT"
-          fi
+          "$TRUSTED/scripts/run_agent.sh" qa \
+            "$TRUSTED/prompts/qa-reviewer.md" \
+            "$RUNNER_TEMP/qa-input.md" \
+            "$RUNNER_TEMP/qa-verdict.md" \
+            "$ISSUE" "$PR"
 
-      - name: Decide verdict and move the label
-        if: steps.guard.outputs.halted != 'true' && steps.agent.outputs.halted != 'true'
+      - name: Escalate on agent failure
+        if: steps.agent.outcome == 'failure'
         env:
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
           ISSUE: ${{ steps.ctx.outputs.issue }}
-          TEST_STATUS: ${{ steps.tests.outputs.status }}
+        run: |
+          "$TRUSTED/scripts/escalate.sh" "Station 3 (QA) failed or returned no/unsafe output. See ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." "$PR" "$ISSUE"
+
+      - name: Decide verdict and move the label (PAT only)
+        if: steps.agent.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
+          ISSUE: ${{ steps.ctx.outputs.issue }}
+          TEST_STATUS: ${{ needs.tests.outputs.status }}
         run: |
           VERDICT="$(head -n1 "$RUNNER_TEMP/qa-verdict.md" | grep -oE '^VERDICT: (APPROVED|CHANGES_REQUESTED)$' | sed 's/VERDICT: //' || true)"
 
           if [ -z "$VERDICT" ]; then
-            .factory/scripts/escalate.sh "QA output had no parseable \`VERDICT:\` first line." "$PR" "$ISSUE"
+            "$TRUSTED/scripts/escalate.sh" "QA output had no parseable \`VERDICT:\` first line." "$PR" "$ISSUE"
             exit 0
           fi
 
@@ -147,12 +190,12 @@ jobs:
           PRIOR="$(gh pr view "$PR" --json comments \
             --jq '[.comments[] | select(.body | contains("<!-- factory:qa-verdict:changes_requested -->"))] | length')"
 
-          # Record the outcome on this run's metrics entry and push it to the factory branch
-          # BEFORE changing labels (the label change may trigger the Builder, which fetches the branch).
+          # Record the outcome and push it to the factory branch BEFORE changing labels
+          # (the label change may trigger the Builder, which fetches the branch).
           OUTCOME="$(echo "$VERDICT" | tr 'A-Z' 'a-z')"
           jq -c --arg o "$OUTCOME" '.outcome = $o' "$RUNNER_TEMP/metric-qa.json" > "$RUNNER_TEMP/metric-qa-final.json"
-          python .factory/scripts/log_metrics.py append "$RUNNER_TEMP/metric-qa-final.json"
-          .factory/scripts/commit_and_push.sh "$BRANCH" "factory: record QA metrics for #${ISSUE} [skip ci]"
+          python3 "$TRUSTED/scripts/log_metrics.py" append "$RUNNER_TEMP/metric-qa-final.json"
+          "$TRUSTED/scripts/commit_and_push.sh" "$BRANCH" "factory: record QA metrics for #${ISSUE} [skip ci]"
 
           if [ "$VERDICT" = "APPROVED" ]; then
             {
@@ -176,13 +219,12 @@ jobs:
             echo
             tail -n +2 "$RUNNER_TEMP/qa-verdict.md"
           } > "$RUNNER_TEMP/qa-comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/qa-comment.md"
 
           if [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; then
-            gh pr comment "$PR" --body-file "$RUNNER_TEMP/qa-comment.md"
             gh pr edit "$PR" --remove-label "shift:qa-inspection"
             # needs-fix -> triggers Station 2 again
             gh pr edit "$PR" --add-label "shift:needs-fix"
           else
-            gh pr comment "$PR" --body-file "$RUNNER_TEMP/qa-comment.md"
-            .factory/scripts/escalate.sh "Retry limit reached: ${ITERATION} QA iterations without approval (max ${MAX_ITERATIONS})." "$PR" "$ISSUE"
+            "$TRUSTED/scripts/escalate.sh" "Retry limit reached: ${ITERATION} QA iterations without approval (max ${MAX_ITERATIONS})." "$PR" "$ISSUE"
           fi

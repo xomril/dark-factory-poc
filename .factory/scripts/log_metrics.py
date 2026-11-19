@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-METRICS_PATH = Path(__file__).resolve().parents[1] / "metrics.json"
+# FACTORY_METRICS lets workflows run a trusted copy of this script against the checked-out file.
+METRICS_PATH = Path(os.environ.get("FACTORY_METRICS") or Path(__file__).resolve().parents[1] / "metrics.json")
 MARKER = re.compile(r"<!-- factory:metric (\{.*?\}) -->")
 
 

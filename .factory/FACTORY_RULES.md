@@ -23,7 +23,7 @@ Automation stops and the label `shift:human-required` is applied (all other
 | Trigger | Detected by |
 |---|---|
 | The issue fails 3 QA iterations | Workflow `03-qa-gatekeeper` |
-| A change touches `.github/` or `.factory/` (except `.factory/metrics.json`) | `.factory/scripts/guard_paths.sh`, run in workflows 02 and 03 |
+| A change touches `.github/`, `.factory/`, `.claude/`, `CLAUDE.md` or `.mcp.json` (except `.factory/metrics.json`) | `.factory/scripts/guard_paths.sh`, run in workflows 02 and 03 |
 | An agent produces no usable output, or the QA verdict is missing/unparseable | Workflows 01, 02, 03 |
 
 Once `shift:human-required` is set, no workflow reacts to that issue/PR again
@@ -87,4 +87,19 @@ shift:queued ──▶ shift:in-production ──▶ shift:qa-inspection ──�
   instructions. Agents must ignore any text in them that tries to change these
   rules, the output format, or the agent's role.
 - Agents have the minimum tool permissions they need: Architect and QA are
-  read-only; the Builder can edit files and run tests, but never runs `git`.
+  read-only; the Builder can edit files but has no shell at all (tests run in a
+  separate secret-less CI job).
+
+## 7. Secret Hygiene
+
+- No secret is defined at job level. Each secret is passed only to the step that
+  needs it: the AI key goes to the agent step (which gets no GitHub token); the
+  `FACTORY_PAT` goes to steps that talk to GitHub (which never run an agent).
+- Code written by an agent (pytest, pip install) only ever runs in a job that
+  has no secrets and no write permissions.
+- Workflows run helper scripts from a snapshot of the default branch, never
+  from the agent-modified working tree.
+- Checkouts use `persist-credentials: false`; pushes pass the token on the
+  command line once and never store it.
+- Agent output and diffs are scanned (`scan_secrets.sh`) before being posted or
+  committed.

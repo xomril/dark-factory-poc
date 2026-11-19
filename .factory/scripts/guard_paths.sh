@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Circuit breaker: fail if the working tree or branch touches critical paths.
 # (FACTORY_RULES.md §2.) `.factory/metrics.json` is the one allowed exception.
+# `.claude/`, CLAUDE.md and .mcp.json are blocked too: the agent CLI would load them
+# as hooks/config in later stations, where secrets are present.
 #
 # Usage: guard_paths.sh <base-branch>      exit 0 = clean, exit 1 = forbidden paths
 set -euo pipefail
@@ -15,7 +17,7 @@ changed="$(
   } | sort -u
 )"
 
-forbidden="$(printf '%s\n' "$changed" | grep -E '^(\.github/|\.factory/)' | grep -vxF '.factory/metrics.json' || true)"
+forbidden="$(printf '%s\n' "$changed" | grep -E '^(\.github/|\.factory/|\.claude/|CLAUDE\.md$|\.mcp\.json$)' | grep -vxF '.factory/metrics.json' || true)"
 
 if [ -n "$forbidden" ]; then
   echo "Forbidden paths touched:" >&2
