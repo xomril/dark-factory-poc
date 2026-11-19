@@ -193,9 +193,11 @@ jobs:
 
           if [ -z "$PR" ]; then
             TITLE="$(gh issue view "$ISSUE" --json title --jq .title)"
+            # "Closes #N" makes GitHub close the issue when a human merges the PR.
+            { cat "$RUNNER_TEMP/builder-summary.md"; printf '\n\nCloses #%s\n' "$ISSUE"; } > "$RUNNER_TEMP/pr-body.md"
             PR="$(gh pr create --base "$BASE" --head "$BRANCH" \
               --title "factory: ${TITLE} (#${ISSUE})" \
-              --body-file "$RUNNER_TEMP/builder-summary.md" | grep -oE '[0-9]+$')"
+              --body-file "$RUNNER_TEMP/pr-body.md" | grep -oE '[0-9]+$')"
             gh pr comment "$PR" --body "Implements #${ISSUE}. Opened by the Dark Factory. **Never auto-merged** — a human must review."
           else
             gh pr comment "$PR" --body-file "$RUNNER_TEMP/builder-summary.md"
