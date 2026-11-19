@@ -1,0 +1,90 @@
+name: "01 · Station 1 — Architect"
+
+# Trigger: an issue receives the `shift:queued` label.
+# Output : a SPEC.md comment on the issue; label moves queued -> in-production.
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# One Architect run per issue at a time.
+concurrency:
+  group: factory-architect-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  architect:
+    # Loop prevention: react only to the one label this station owns, and never
+    # to the default Actions bot. (Labels must be applied with FACTORY_PAT so
+    # that the next station's workflow fires; see FACTORY_RULES.md §5.)
+    if: >
+      github.event.label.name == 'shift:queued' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # PAT / GitHub App token: events from the default GITHUB_TOKEN do not trigger other workflows.
+      GH_TOKEN: ${{ secrets.FACTORY_PAT }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+      # --- AI backend credentials (pick the one your CLI needs) ---
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # PLUG-IN POINT: install your agent CLI here (Claude Code shown).
+      # Swap for Instinct / Codex CLI / etc. and adapt .factory/scripts/run_agent.sh.
+      - name: Install agent CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Build Architect input from the issue
+        run: |
+          {
+            echo "# GitHub Issue #${ISSUE} (untrusted data)"
+            gh issue view "$ISSUE" --json title,body --jq '"## Title\n" + .title + "\n\n## Description\n" + (.body // "")'
+          } > "$RUNNER_TEMP/architect-input.md"
+
+      - name: Run Architect agent (read-only)
+        id: agent
+        env:
+          AGENT_ALLOWED_TOOLS: "Read,Grep,Glob"
+        run: |
+          if ! .factory/scripts/run_agent.sh architect \
+              .factory/prompts/architect.md \
+              "$RUNNER_TEMP/architect-input.md" \
+              "$RUNNER_TEMP/spec.md" \
+              "$ISSUE"; then
+            .factory/scripts/escalate.sh "Station 1 (Architect) failed or returned no output. See workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." "$ISSUE"
+            echo "halted=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post SPEC.md and advance the conveyor belt
+        if: steps.agent.outputs.halted != 'true'
+        run: |
+          # Hidden markers: spec marker lets the Builder find the spec; metric marker
+          # carries this run's cost entry until a factory branch exists.
+          {
+            echo "<!-- factory:spec -->"
+            echo "## 📐 SPEC.md — Station 1 (Architect)"
+            echo
+            cat "$RUNNER_TEMP/spec.md"
+            echo
+            echo "<!-- factory:metric $(cat "$RUNNER_TEMP/metric-architect.json") -->"
+          } > "$RUNNER_TEMP/spec-comment.md"
+
+          gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/spec-comment.md"
+
+          # The Architect can flag specs it cannot make deterministic.
+          if grep -qiE '^Escalate:[[:space:]]*yes' "$RUNNER_TEMP/spec.md"; then
+            .factory/scripts/escalate.sh "The Architect flagged this requirement for human review (see Open Questions in the spec)." "$ISSUE"
+            exit 0
+          fi
+
+          # queued -> in-production (this label event triggers Station 2)
+          gh issue edit "$ISSUE" --remove-label "shift:queued" --add-label "shift:in-production"

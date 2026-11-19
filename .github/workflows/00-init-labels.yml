@@ -1,0 +1,27 @@
+name: "00 · Init factory labels"
+
+# Run once (Actions tab -> "00 · Init factory labels" -> Run workflow).
+# Idempotent: --force updates labels that already exist.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  provision-labels:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Create shift:* labels
+        run: |
+          create() { gh label create "$1" --color "$2" --description "$3" --force; }
+          create "shift:queued"          "BFD4F2" "Factory: waiting for the Architect"
+          create "shift:in-production"   "1D76DB" "Factory: spec ready, Builder working"
+          create "shift:qa-inspection"   "FBCA04" "Factory: QA Gatekeeper reviewing"
+          create "shift:needs-fix"       "D93F0B" "Factory: QA requested changes, back to Builder"
+          create "shift:ready-for-human" "0E8A16" "Factory: approved by QA, awaiting human review/merge"
+          create "shift:human-required"  "B60205" "Factory halted: human intervention required"

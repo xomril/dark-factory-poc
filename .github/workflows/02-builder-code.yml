@@ -1,0 +1,186 @@
+name: "02 · Station 2 — Builder"
+
+# Triggers:
+#   * an issue is labeled `shift:in-production`  (first build, spec is ready)
+#   * a PR is labeled `shift:needs-fix`          (QA bounced it back)
+# Output: commits on `factory/issue-<n>`, an open/updated PR, label -> shift:qa-inspection.
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# One Builder run per factory branch at a time (never cancel a run mid-push).
+concurrency:
+  group: factory-builder-${{ github.event.pull_request.head.ref || format('factory/issue-{0}', github.event.issue.number) }}
+  cancel-in-progress: false
+
+jobs:
+  builder:
+    # Loop prevention: label-based state machine. Each trigger is one exact
+    # label, and PR events are accepted only from our own factory branches.
+    if: >
+      github.actor != 'github-actions[bot]' && (
+        (github.event_name == 'issues' &&
+         github.event.label.name == 'shift:in-production') ||
+        (github.event_name == 'pull_request' &&
+         github.event.label.name == 'shift:needs-fix' &&
+         startsWith(github.event.pull_request.head.ref, 'factory/issue-') &&
+         github.event.pull_request.head.repo.full_name == github.repository)
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.FACTORY_PAT }}
+      GH_REPO: ${{ github.repository }}
+      BASE: ${{ github.event.repository.default_branch }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Resolve issue / branch / PR
+        id: ctx
+        env:
+          EVENT: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [ "$EVENT" = "issues" ]; then
+            ISSUE="$ISSUE_NUMBER"; PR=""
+          else
+            ISSUE="${HEAD_REF#factory/issue-}"; PR="$PR_NUMBER"
+          fi
+          [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "::error::bad issue number"; exit 1; }
+          BRANCH="factory/issue-${ISSUE}"
+          # An existing PR for this branch (issue-triggered re-runs)?
+          [ -n "$PR" ] || PR="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          {
+            echo "issue=$ISSUE"; echo "pr=$PR"; echo "branch=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FACTORY_PAT }}
+
+      - name: Create or checkout factory branch
+        env:
+          BRANCH: ${{ steps.ctx.outputs.branch }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project + agent CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          # PLUG-IN POINT: install your agent CLI (Claude Code shown).
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Gather spec and QA feedback
+        env:
+          ISSUE: ${{ steps.ctx.outputs.issue }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: |
+          SPEC="$(gh issue view "$ISSUE" --json comments \
+            --jq '[.comments[] | select(.body | contains("<!-- factory:spec -->"))] | last | .body // empty')"
+          [ -n "$SPEC" ] || { echo "::error::No factory spec found on issue #$ISSUE"; exit 1; }
+
+          {
+            echo "# Technical Spec for issue #${ISSUE}"
+            echo "$SPEC"
+            if [ -n "$PR" ]; then
+              FEEDBACK="$(gh pr view "$PR" --json comments \
+                --jq '[.comments[] | select(.body | contains("<!-- factory:qa-verdict:changes_requested -->"))] | last | .body // empty')"
+              if [ -n "$FEEDBACK" ]; then
+                echo
+                echo "# QA feedback from the previous iteration (address every item)"
+                echo "$FEEDBACK"
+              fi
+            fi
+          } > "$RUNNER_TEMP/builder-input.md"
+
+          # Carry Architect metrics (hidden issue-comment markers) into metrics.json on this branch.
+          gh issue view "$ISSUE" --json comments --jq '.comments[].body' | python .factory/scripts/log_metrics.py ingest
+
+      - name: Run Builder agent
+        id: agent
+        env:
+          ISSUE: ${{ steps.ctx.outputs.issue }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          # Builder may edit files and run tests; git is deliberately NOT allowed.
+          AGENT_ALLOWED_TOOLS: "Read,Grep,Glob,Write,Edit,Bash(python -m pytest:*),Bash(pytest:*),Bash(ls:*)"
+        run: |
+          if ! .factory/scripts/run_agent.sh builder \
+              .factory/prompts/builder.md \
+              "$RUNNER_TEMP/builder-input.md" \
+              "$RUNNER_TEMP/builder-summary.md" \
+              "$ISSUE" "$PR"; then
+            .factory/scripts/escalate.sh "Station 2 (Builder) failed or returned no output. See ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." "$ISSUE" "$PR"
+            echo "halted=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guard critical paths
+        id: guard
+        if: steps.agent.outputs.halted != 'true'
+        env:
+          ISSUE: ${{ steps.ctx.outputs.issue }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: |
+          if ! .factory/scripts/guard_paths.sh "$BASE"; then
+            # Discard the Builder's work: nothing is committed.
+            git reset --hard HEAD && git clean -fd
+            .factory/scripts/escalate.sh "The Builder attempted to modify protected paths (\`.github/\` or \`.factory/\`). Changes were discarded." "$ISSUE" "$PR"
+            echo "halted=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit, push to factory branch, open or update PR
+        id: ship
+        if: steps.agent.outputs.halted != 'true' && steps.guard.outputs.halted != 'true'
+        env:
+          ISSUE: ${{ steps.ctx.outputs.issue }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          BRANCH: ${{ steps.ctx.outputs.branch }}
+        run: |
+          python .factory/scripts/log_metrics.py append "$RUNNER_TEMP/metric-builder.json"
+
+          # Did the Builder change any real code? (ignore metrics-only diffs)
+          git add -A
+          CODE_CHANGES="$(git diff --cached --name-only | grep -vxF '.factory/metrics.json' || true)"
+          AHEAD="$(git rev-list --count "origin/${BASE}..HEAD")"
+          if [ -z "$CODE_CHANGES" ] && [ "$AHEAD" = "0" ]; then
+            .factory/scripts/escalate.sh "The Builder produced no code changes." "$ISSUE" "$PR"
+            exit 0
+          fi
+
+          ITERATION="$(gh pr view "${PR:-0}" --json comments --jq '[.comments[] | select(.body | contains("factory:qa-verdict:changes_requested"))] | length' 2>/dev/null || echo 0)"
+          .factory/scripts/commit_and_push.sh "$BRANCH" "factory: implement #${ISSUE} (build $((ITERATION + 1)))"
+
+          if [ -z "$PR" ]; then
+            TITLE="$(gh issue view "$ISSUE" --json title --jq .title)"
+            PR="$(gh pr create --base "$BASE" --head "$BRANCH" \
+              --title "factory: ${TITLE} (#${ISSUE})" \
+              --body-file "$RUNNER_TEMP/builder-summary.md" | grep -oE '[0-9]+$')"
+            gh pr comment "$PR" --body "Implements #${ISSUE}. Opened by the Dark Factory. **Never auto-merged** — a human must review."
+          else
+            gh pr comment "$PR" --body-file "$RUNNER_TEMP/builder-summary.md"
+          fi
+
+          # in-production / needs-fix -> qa-inspection (this label event triggers Station 3)
+          gh pr edit "$PR" --remove-label "shift:needs-fix" || true
+          gh pr edit "$PR" --add-label "shift:qa-inspection"
